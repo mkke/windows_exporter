@@ -42,6 +42,10 @@ import (
 	"github.com/prometheus-community/windows_exporter/internal/log/flag"
 	"github.com/prometheus-community/windows_exporter/internal/utils"
 	"github.com/prometheus-community/windows_exporter/pkg/collector"
+	"github.com/prometheus/client_golang/prometheus"
+	collversion "github.com/prometheus/client_golang/prometheus/collectors/version"
+	"github.com/prometheus/client_golang/prometheus/push"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
@@ -109,6 +113,14 @@ func run(ctx context.Context, args []string) int {
 			"process.memory-limit",
 			"Limit memory usage in bytes. This is a soft-limit and not guaranteed. 0 means no limit. Read more at https://pkg.go.dev/runtime/debug#SetMemoryLimit .",
 		).Default("200000000").Int64()
+		pushUrl = app.Flag(
+			"push.url",
+			"Push metrics to this url.",
+		).Default("").String()
+		pushJob = app.Flag(
+			"push.job",
+			"Push job name",
+		).Default("windows_exporter").String()
 	)
 
 	logFile := &log.AllowedFile{}
@@ -231,6 +243,55 @@ func run(ctx context.Context, args []string) int {
 
 		close(errCh)
 	}()
+
+	if *pushUrl != "" {
+		reg := prometheus.NewRegistry()
+		reg.MustRegister(collversion.NewCollector("windows_exporter"))
+
+		collectionHandler, err := collectors.NewHandler(time.Minute, logger, nil)
+		if err != nil {
+			logger.LogAttrs(ctx, slog.LevelError, "couldn't initialize push collector handler", slog.Any("err", err))
+			return 1
+		}
+
+		if err := reg.Register(collectionHandler); err != nil {
+			logger.LogAttrs(ctx, slog.LevelError, "couldn't register push collector handler", slog.Any("err", err))
+			return 1
+		}
+
+		doPush := func() {
+			pushCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+
+			pusher := push.New(*pushUrl, *pushJob).
+				Format(expfmt.NewFormat(expfmt.TypeTextPlain)). // needed by VictoriaMetrics
+				Gatherer(reg)
+
+			if hostName, err := os.Hostname(); err == nil {
+				hostName = strings.ToLower(hostName)
+				pusher = pusher.Grouping("instance", hostName)
+			}
+
+			if err := pusher.PushContext(pushCtx); err != nil {
+				logger.LogAttrs(ctx, slog.LevelWarn, fmt.Sprintf("metrics: push failed: %v\n", err))
+			}
+		}
+
+		go func() {
+			logger.LogAttrs(ctx, slog.LevelInfo, fmt.Sprintf("metrics: pushing to %s\n", *pushUrl))
+			doPush()
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					doPush()
+				}
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
