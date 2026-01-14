@@ -123,6 +123,10 @@ func run(ctx context.Context, args []string) int {
 			"push.server-name-override",
 			"Push TLS server name override",
 		).Default("").String()
+		pushServerAddressOverride = app.Flag(
+			"push.server-address-override",
+			"Push server address override",
+		).Default("").String()
 		pushInsecureSkipVerify = app.Flag(
 			"push.insecure-skip-verify",
 			"Push TLS skip hostname verification",
@@ -269,18 +273,28 @@ func run(ctx context.Context, args []string) int {
 			return 1
 		}
 
-		httpClient := &http.Client{
-			Timeout: time.Second * 60,
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout: 5 * time.Second,
-				}).DialContext,
-				TLSHandshakeTimeout: 5 * time.Second,
-				TLSClientConfig: &tls.Config{
-					ServerName:         *pushServerNameOverride,
-					InsecureSkipVerify: *pushInsecureSkipVerify,
-				},
+		dialer := &net.Dialer{
+			Timeout: 5 * time.Second,
+		}
+
+		httpTransport := &http.Transport{
+			DialContext:         dialer.DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+			TLSClientConfig: &tls.Config{
+				ServerName:         *pushServerNameOverride,
+				InsecureSkipVerify: *pushInsecureSkipVerify,
 			},
+		}
+
+		if addressOverride := *pushServerAddressOverride; addressOverride != "" {
+			httpTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, addressOverride)
+			}
+		}
+
+		httpClient := &http.Client{
+			Timeout:   time.Second * 60,
+			Transport: httpTransport,
 		}
 
 		pusher := push.New(*pushUrl, *pushJob).
