@@ -21,9 +21,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -117,6 +119,14 @@ func run(ctx context.Context, args []string) int {
 			"push.url",
 			"Push metrics to this url.",
 		).Default("").String()
+		pushServerNameOverride = app.Flag(
+			"push.server-name-override",
+			"Push TLS server name override",
+		).Default("").String()
+		pushInsecureSkipVerify = app.Flag(
+			"push.insecure-skip-verify",
+			"Push TLS skip hostname verification",
+		).Bool()
 		pushJob = app.Flag(
 			"push.job",
 			"Push job name",
@@ -259,26 +269,41 @@ func run(ctx context.Context, args []string) int {
 			return 1
 		}
 
+		httpClient := &http.Client{
+			Timeout: time.Second * 60,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: 5 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout: 5 * time.Second,
+				TLSClientConfig: &tls.Config{
+					ServerName:         *pushServerNameOverride,
+					InsecureSkipVerify: *pushInsecureSkipVerify,
+				},
+			},
+		}
+
+		pusher := push.New(*pushUrl, *pushJob).
+			Client(httpClient).
+			Format(expfmt.NewFormat(expfmt.TypeTextPlain)). // needed by VictoriaMetrics
+			Gatherer(reg)
+
+		if hostName, err := os.Hostname(); err == nil {
+			hostName = strings.ToLower(hostName)
+			pusher = pusher.Grouping("instance", hostName)
+		}
+
 		doPush := func() {
 			pushCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 
-			pusher := push.New(*pushUrl, *pushJob).
-				Format(expfmt.NewFormat(expfmt.TypeTextPlain)). // needed by VictoriaMetrics
-				Gatherer(reg)
-
-			if hostName, err := os.Hostname(); err == nil {
-				hostName = strings.ToLower(hostName)
-				pusher = pusher.Grouping("instance", hostName)
-			}
-
 			if err := pusher.PushContext(pushCtx); err != nil {
-				logger.LogAttrs(ctx, slog.LevelWarn, fmt.Sprintf("metrics: push failed: %v\n", err))
+				logger.LogAttrs(ctx, slog.LevelWarn, fmt.Sprintf("metrics: push failed: %v", err))
 			}
 		}
 
 		go func() {
-			logger.LogAttrs(ctx, slog.LevelInfo, fmt.Sprintf("metrics: pushing to %s\n", *pushUrl))
+			logger.LogAttrs(ctx, slog.LevelInfo, fmt.Sprintf("metrics: pushing to %s", *pushUrl))
 			doPush()
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
