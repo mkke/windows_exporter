@@ -288,7 +288,7 @@ func run(ctx context.Context, args []string) int {
 
 		if addressOverride := *pushServerAddressOverride; addressOverride != "" {
 			httpTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, network, addressOverride)
+				return dialer.DialContext(ctx, network, addressOverride+addr[strings.LastIndex(addr, ":"):])
 			}
 		}
 
